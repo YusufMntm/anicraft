@@ -14,7 +14,9 @@
 
 use anicraft_doc::width::left_normal;
 use anicraft_doc::{Cap, DisplayItem, DisplayList, Join, Stroke, WidthProfile};
-use anicraft_geom::{Affine, Path, Polyline, Vec2, polygons};
+use anicraft_geom::{Affine, Path, PathCmd, Polyline, Vec2, polygons};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 #[cfg(test)]
 fn signed_area(p: &[Vec2]) -> f32 {
@@ -706,6 +708,458 @@ pub fn outline_variable_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, Displa
     std::borrow::Cow::Owned(DisplayList { links: Vec::new(), clip_modes: dl.clip_modes.clone(), items, clip_parents: dl.clip_parents.clone(), groups: dl.groups.clone(), left_out: dl.left_out })
 }
 
+/// Runs examined per grid cell when chaining raw stroke runs.
+const CHAIN_SCAN: usize = 16;
+
+/// One segment of a raw stroke subpath, keeping its exact curve type.
+#[derive(Clone, Copy)]
+enum RawSeg {
+    Line(Vec2),
+    Quad(Vec2, Vec2),
+    Cubic(Vec2, Vec2, Vec2),
+}
+
+impl RawSeg {
+    fn end(self) -> Vec2 {
+        match self {
+            RawSeg::Line(p) | RawSeg::Quad(_, p) | RawSeg::Cubic(_, _, p) => p,
+        }
+    }
+
+    fn finite(self) -> bool {
+        match self {
+            RawSeg::Line(p) => p.is_finite(),
+            RawSeg::Quad(c, p) => c.is_finite() && p.is_finite(),
+            RawSeg::Cubic(c1, c2, p) => c1.is_finite() && c2.is_finite() && p.is_finite(),
+        }
+    }
+
+    fn set_end(&mut self, p: Vec2) {
+        match self {
+            RawSeg::Line(e) | RawSeg::Quad(_, e) | RawSeg::Cubic(_, _, e) => *e = p,
+        }
+    }
+
+    fn push_to(self, path: &mut Path) {
+        match self {
+            RawSeg::Line(p) => { path.line_to(p); }
+            RawSeg::Quad(c, p) => { path.quad_to(c, p); }
+            RawSeg::Cubic(c1, c2, p) => { path.cubic_to(c1, c2, p); }
+        }
+    }
+}
+
+/// One subpath extracted from a raw stroke display item in the bucket's common local space.
+struct RawSub {
+    start: Vec2,
+    segs: Vec<RawSeg>,
+    closed: bool,
+    item: usize,
+}
+
+impl RawSub {
+    fn end(&self) -> Vec2 {
+        self.segs.last().map_or(self.start, |s| s.end())
+    }
+
+    fn reverse(self) -> RawSub {
+        let end = self.end();
+        let mut rev = Vec::with_capacity(self.segs.len());
+        let mut prev = self.start;
+        for seg in self.segs {
+            let next_prev = seg.end();
+            rev.push(match seg {
+                RawSeg::Line(_) => RawSeg::Line(prev),
+                RawSeg::Quad(c, _) => RawSeg::Quad(c, prev),
+                RawSeg::Cubic(c1, c2, _) => RawSeg::Cubic(c2, c1, prev),
+            });
+            prev = next_prev;
+        }
+        rev.reverse();
+        RawSub { start: end, segs: rev, closed: self.closed, item: self.item }
+    }
+
+    fn to_path(&self) -> Path {
+        let mut p = Path::new();
+        p.move_to(self.start);
+        for seg in &self.segs {
+            seg.push_to(&mut p);
+        }
+        if self.closed {
+            p.close();
+        }
+        p
+    }
+}
+
+fn is_joinable_raw_stroke(it: &DisplayItem) -> bool {
+    it.merge
+        && it.fill.is_none()
+        && it.outline.is_none()
+        && !it.guide
+        && it.warp.is_none()
+        && it.transform.is_finite()
+        && it.stroke.as_ref().is_some_and(|st| st.profile.is_none() && st.width.is_finite() && st.width > 0.0)
+}
+
+fn same_raw_run(a: &DisplayItem, b: &DisplayItem) -> bool {
+    a.layer == b.layer && a.clip == b.clip && a.masks == b.masks && a.group == b.group
+}
+
+fn raw_bucket_hash(it: &DisplayItem) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let bits = |v: f32| if v == 0.0 { 0u32 } else { v.to_bits() };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for &v in &it.transform.m[..4] {
+        bits(v).hash(&mut h);
+    }
+    if let Some(st) = &it.stroke {
+        bits(st.width).hash(&mut h);
+        [st.color.r, st.color.g, st.color.b, st.color.a].map(bits).hash(&mut h);
+        let cap: u8 = match st.style.cap { Cap::Butt => 0, Cap::Round => 1, Cap::Square => 2 };
+        let join: u8 = match st.style.join { Join::Miter => 0, Join::Round => 1, Join::Bevel => 2 };
+        (cap, join, bits(st.style.miter_limit), st.style.dash.is_some()).hash(&mut h);
+    }
+    for v in it.color.mul.into_iter().chain(it.color.add) {
+        bits(v).hash(&mut h);
+    }
+    h.finish()
+}
+
+fn extract_raw_subs(path: &Path, into: &Affine, item: usize) -> Option<Vec<RawSub>> {
+    let mut out = Vec::new();
+    let mut cur: Option<RawSub> = None;
+    let mut last = Vec2::ZERO;
+    for cmd in &path.cmds {
+        match *cmd {
+            PathCmd::MoveTo(p) => {
+                if let Some(s) = cur.take().filter(|s| !s.segs.is_empty()) {
+                    out.push(s);
+                }
+                let q = into.apply(p);
+                if !q.is_finite() {
+                    return None;
+                }
+                cur = Some(RawSub { start: q, segs: Vec::new(), closed: false, item });
+                last = q;
+            }
+            PathCmd::LineTo(p) => {
+                let q = into.apply(p);
+                let seg = RawSeg::Line(q);
+                if !seg.finite() {
+                    return None;
+                }
+                cur.get_or_insert(RawSub { start: last, segs: Vec::new(), closed: false, item }).segs.push(seg);
+                last = q;
+            }
+            PathCmd::QuadTo(c, p) => {
+                let (c, q) = (into.apply(c), into.apply(p));
+                let seg = RawSeg::Quad(c, q);
+                if !seg.finite() {
+                    return None;
+                }
+                cur.get_or_insert(RawSub { start: last, segs: Vec::new(), closed: false, item }).segs.push(seg);
+                last = q;
+            }
+            PathCmd::CubicTo(c1, c2, p) => {
+                let (c1, c2, q) = (into.apply(c1), into.apply(c2), into.apply(p));
+                let seg = RawSeg::Cubic(c1, c2, q);
+                if !seg.finite() {
+                    return None;
+                }
+                cur.get_or_insert(RawSub { start: last, segs: Vec::new(), closed: false, item }).segs.push(seg);
+                last = q;
+            }
+            PathCmd::Close => {
+                if let Some(mut s) = cur.take() {
+                    if s.start.distance(last) > 1e-6 {
+                        s.segs.push(RawSeg::Line(s.start));
+                    }
+                    s.closed = true;
+                    last = s.start;
+                    if !s.segs.is_empty() {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(s) = cur.filter(|s| !s.segs.is_empty()) {
+        out.push(s);
+    }
+    Some(out)
+}
+
+fn raw_grid_key(v: Vec2, cell: f32) -> (i64, i64) {
+    ((v.x / cell).floor() as i64, (v.y / cell).floor() as i64)
+}
+
+/// Whether exactly two open endpoints of `ends` lie within `tol` of `at`: a plain corner where
+/// two stroke runs meet with no ambiguity.
+fn raw_plain_corner(ends: &HashMap<(i64, i64), Vec<Vec2>>, at: Vec2, tol: f32, cell: f32) -> bool {
+    let (kx, ky) = raw_grid_key(at, cell);
+    let mut n = 0;
+    for dx in -1..=1_i64 {
+        for dy in -1..=1_i64 {
+            let Some(list) = ends.get(&(kx.saturating_add(dx), ky.saturating_add(dy))) else { continue };
+            if list.len() > CHAIN_SCAN {
+                return false;
+            }
+            n += list.iter().filter(|e| e.distance(at) <= tol).count();
+        }
+    }
+    n == 2
+}
+
+/// The last remaining open subpath with an endpoint within `tol` of `at`.
+fn raw_chain_find(grid: &mut HashMap<(i64, i64), Vec<usize>>, slots: &[Option<RawSub>], at: Vec2, tol: f32, cell: f32) -> Option<usize> {
+    let (kx, ky) = raw_grid_key(at, cell);
+    let mut best: Option<usize> = None;
+    for dx in -1..=1_i64 {
+        for dy in -1..=1_i64 {
+            let Some(list) = grid.get_mut(&(kx.saturating_add(dx), ky.saturating_add(dy))) else { continue };
+            let mut seen = 0;
+            let mut k = list.len();
+            while k > 0 && seen < CHAIN_SCAN {
+                k -= 1;
+                seen += 1;
+                let Some(&i) = list.get(k) else { break };
+                let Some(s) = slots.get(i).and_then(Option::as_ref) else {
+                    if k + 1 == list.len() {
+                        list.pop();
+                    }
+                    continue;
+                };
+                if best.is_some_and(|b| b >= i) {
+                    break;
+                }
+                if s.start.distance(at) <= tol || s.end().distance(at) <= tol {
+                    best = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Chains open subpaths of `members` (same style, linear transform and colour transform) at plain
+/// degree-2 corners; returns `None` when nothing joins.
+fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, DisplayItem)>> {
+    let &first = members.first()?;
+    let base = dl.items.get(first)?;
+    let base_xf = base.transform;
+    let inv = base_xf.inverse()?;
+    let scale = base_xf.mean_scale();
+    if !(scale.is_finite() && scale > 1e-6) {
+        return None;
+    }
+    let tol = anicraft_geom::planar::SNAP / scale;
+    let cell = if tol.is_finite() && tol > 0.0 { tol } else { 1.0 };
+
+    let mut unchanged: Vec<(usize, DisplayItem)> = Vec::new();
+    let mut closed_extra: Vec<RawSub> = Vec::new();
+    let mut open: Vec<RawSub> = Vec::new();
+    for &idx in members {
+        let it = dl.items.get(idx)?;
+        let into = inv.mul(&it.transform);
+        if !into.is_finite() {
+            return None;
+        }
+        let subs = extract_raw_subs(&it.path, &into, idx)?;
+        if !subs.iter().any(|s| !s.closed) {
+            unchanged.push((idx, it.clone()));
+            continue;
+        }
+        for s in subs {
+            if s.closed { closed_extra.push(s); } else { open.push(s); }
+        }
+    }
+    if open.len() < 2 {
+        return None;
+    }
+    open.reverse(); // popped in drawing order
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut ends: HashMap<(i64, i64), Vec<Vec2>> = HashMap::new();
+    for (i, s) in open.iter().enumerate() {
+        let (a, b) = (raw_grid_key(s.start, cell), raw_grid_key(s.end(), cell));
+        grid.entry(a).or_default().push(i);
+        if b != a {
+            grid.entry(b).or_default().push(i);
+        }
+        ends.entry(a).or_default().push(s.start);
+        ends.entry(b).or_default().push(s.end());
+    }
+    let mut slots: Vec<Option<RawSub>> = open.into_iter().map(Some).collect();
+    let mut joined_any = false;
+    let mut built: Vec<(usize, DisplayItem)> = Vec::new();
+    while let Some(cur) = slots.iter_mut().rev().find_map(Option::take) {
+        while matches!(slots.last(), Some(None)) {
+            slots.pop();
+        }
+        let mut max_item = cur.item;
+        let mut start = cur.start;
+        let mut segs: VecDeque<RawSeg> = VecDeque::from(cur.segs);
+        let mut closed = false;
+        loop {
+            let tail = segs.back().map_or(start, |g| g.end());
+            if segs.len() > 1 && tail.distance(start) <= tol {
+                closed = true;
+                break;
+            }
+            if raw_plain_corner(&ends, tail, tol, cell)
+                && let Some(next) = raw_chain_find(&mut grid, &slots, tail, tol, cell).and_then(|j| slots.get_mut(j)?.take())
+            {
+                let next = if next.start.distance(tail) <= tol { next } else { next.reverse() };
+                max_item = max_item.max(next.item);
+                segs.extend(next.segs);
+                joined_any = true;
+                continue;
+            }
+            if raw_plain_corner(&ends, start, tol, cell)
+                && let Some(prev) = raw_chain_find(&mut grid, &slots, start, tol, cell).and_then(|j| slots.get_mut(j)?.take())
+            {
+                let prev = if prev.end().distance(start) <= tol { prev } else { prev.reverse() };
+                max_item = max_item.max(prev.item);
+                start = prev.start;
+                for g in prev.segs.into_iter().rev() {
+                    segs.push_front(g);
+                }
+                joined_any = true;
+                continue;
+            }
+            break;
+        }
+        if !closed && segs.len() > 1 && segs.back().is_some_and(|g| g.end().distance(start) <= tol) {
+            closed = true;
+        }
+        if closed && let Some(last) = segs.back_mut() {
+            last.set_end(start);
+        }
+        let mut path = Path::new();
+        path.move_to(start);
+        for seg in segs {
+            seg.push_to(&mut path);
+        }
+        if closed {
+            path.close();
+        }
+        built.push((max_item, DisplayItem { path: Arc::new(path), transform: base_xf, ..base.clone() }));
+    }
+    if !joined_any {
+        return None;
+    }
+    for sub in closed_extra {
+        built.push((sub.item, DisplayItem { path: Arc::new(sub.to_path()), transform: base_xf, ..base.clone() }));
+    }
+    built.extend(unchanged);
+    Some(built)
+}
+
+/// `dl` with contiguous raw stroke runs (`DisplayItem::merge`) of the same style that meet at
+/// plain degree-2 corners chained into continuous paths, so corner joins (Miter, Round, Bevel)
+/// render across the separate stroke elements merge drawing splits at corners (ADR 0031, 0046).
+/// Borrowed unchanged when no raw strokes join.
+pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
+    let has_pair = dl.items.windows(2).any(|w| {
+        w.first().zip(w.get(1)).is_some_and(|(a, b)| is_joinable_raw_stroke(a) && is_joinable_raw_stroke(b) && same_raw_run(a, b))
+    });
+    if !has_pair {
+        return std::borrow::Cow::Borrowed(dl);
+    }
+    let mut items: Vec<DisplayItem> = Vec::with_capacity(dl.items.len());
+    let track_links = !dl.links.is_empty();
+    let mut remap: Vec<Option<u32>> = if track_links { vec![None; dl.items.len()] } else { Vec::new() };
+    let mut any_changed = false;
+    let mut i = 0;
+    while i < dl.items.len() {
+        let Some(first) = dl.items.get(i) else { break };
+        if !is_joinable_raw_stroke(first) {
+            if let Some(slot) = remap.get_mut(i) {
+                *slot = u32::try_from(items.len()).ok();
+            }
+            items.push(first.clone());
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while let Some(next) = dl.items.get(end) {
+            if is_joinable_raw_stroke(next) && same_raw_run(first, next) { end += 1; } else { break; }
+        }
+        if end - start < 2 {
+            if let Some(slot) = remap.get_mut(start) {
+                *slot = u32::try_from(items.len()).ok();
+            }
+            items.push(first.clone());
+            i = end;
+            continue;
+        }
+        // Group items in this contiguous run by style, linear transform and colour transform.
+        let mut buckets: Vec<Vec<usize>> = Vec::new();
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        for idx in start..end {
+            let Some(it) = dl.items.get(idx) else { continue };
+            let key = it.transform.inverse().map(|_| raw_bucket_hash(it));
+            let found = key.and_then(|k| {
+                by_hash.get(&k).and_then(|cands| {
+                    cands.iter().copied().find(|&bi| {
+                        buckets.get(bi).and_then(|b| b.first()).and_then(|&j| dl.items.get(j)).is_some_and(|rep| {
+                            rep.transform.inverse().is_some() && rep.transform.m[..4] == it.transform.m[..4] && rep.stroke == it.stroke && rep.color == it.color
+                        })
+                    })
+                })
+            });
+            match found {
+                Some(bi) => {
+                    if let Some(b) = buckets.get_mut(bi) { b.push(idx); }
+                }
+                None => {
+                    if let Some(k) = key {
+                        by_hash.entry(k).or_default().push(buckets.len());
+                    }
+                    buckets.push(vec![idx]);
+                }
+            }
+        }
+        let mut emitted: Vec<Vec<DisplayItem>> = vec![Vec::new(); end - start];
+        for bucket in &buckets {
+            if bucket.len() >= 2
+                && let Some(chained) = chain_raw_bucket(dl, bucket)
+            {
+                any_changed = true;
+                for (slot_idx, it) in chained {
+                    if let Some(slot) = emitted.get_mut(slot_idx.saturating_sub(start)) {
+                        slot.push(it);
+                    }
+                }
+            } else {
+                for &idx in bucket {
+                    if let (Some(slot), Some(it)) = (emitted.get_mut(idx.saturating_sub(start)), dl.items.get(idx)) {
+                        slot.push(it.clone());
+                    }
+                }
+            }
+        }
+        for (off, list) in emitted.into_iter().enumerate() {
+            if let Some(slot) = remap.get_mut(start + off) {
+                *slot = u32::try_from(items.len()).ok();
+            }
+            items.extend(list);
+        }
+        i = end;
+    }
+    if !any_changed {
+        return std::borrow::Cow::Borrowed(dl);
+    }
+    let links = if track_links {
+        dl.links.iter().filter_map(|(idx, url)| remap.get(*idx as usize).copied().flatten().map(|n| (n, url.clone()))).collect()
+    } else {
+        Vec::new()
+    };
+    std::borrow::Cow::Owned(DisplayList { links, clip_modes: dl.clip_modes.clone(), items, clip_parents: dl.clip_parents.clone(), groups: dl.groups.clone(), left_out: dl.left_out })
+}
+
 #[cfg(test)]
 #[path = "stroke_style_tests.rs"]
 mod style_tests;
@@ -973,6 +1427,7 @@ mod tests {
             image: None,
             smooth: true,
             warp: None,
+            merge: false,
         };
         let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![item], clip_parents: Vec::new(), groups: Vec::new() };
         let view = crate::View { transform: Affine::IDENTITY, width: 400, height: 300, background: Some(anicraft_doc::Rgba::WHITE) };

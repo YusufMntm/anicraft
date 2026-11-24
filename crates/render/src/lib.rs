@@ -149,6 +149,7 @@ pub fn render(dl: &DisplayList, view: &View) -> Result<(Pixmap, RenderStats), Re
 /// [`render`]; `cut` off prepares every item whole (see [`unseen`]), which draws the same
 /// pixels more slowly: the tests compare the two.
 fn render_cut(dl: &DisplayList, view: &View, cut: bool) -> Result<(Pixmap, RenderStats), RenderError> {
+    let dl = &*stroke::join_raw_strokes(dl);
     let mut pm = Pixmap::new(view.width, view.height)?;
     // The background is filled band by band, in parallel, just before each band draws (a
     // serial fill of a 1080p float buffer cost as much as all the drawing).
@@ -370,6 +371,7 @@ pub struct Scene {
 /// fills come as [`Shader::Bitmap`]; filtered groups as [`Scene::layers`]. It doesn't fail
 /// today; the `Err` is for what a future display list could hold that only [`render`] draws.
 pub fn prepare_scene(dl: &DisplayList, view: &View) -> Result<(Scene, RenderStats), NeedsFull> {
+    let dl = &*stroke::join_raw_strokes(dl);
     let surface = IRect { x0: 0, y0: 0, x1: view.width as i32, y1: view.height as i32 };
     let runs = filtered_runs(dl);
     let in_run = in_runs(dl, &runs);
@@ -1087,6 +1089,7 @@ mod tests {
             image: None,
             smooth: true,
             warp: None,
+            merge: false,
         }
     }
 
