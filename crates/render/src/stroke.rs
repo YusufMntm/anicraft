@@ -15,7 +15,7 @@
 use anicraft_doc::width::left_normal;
 use anicraft_doc::{Cap, DisplayItem, DisplayList, Join, Stroke, WidthProfile};
 use anicraft_geom::{Affine, Path, PathCmd, Polyline, Vec2, polygons};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -806,97 +806,257 @@ fn is_joinable_raw_stroke(it: &DisplayItem) -> bool {
     is_raw_stroke(it) && it.stroke.as_ref().is_some_and(|st| st.profile.is_none())
 }
 
+type RawRunScope = (anicraft_doc::LayerId, Option<u32>, Option<u32>, Option<u32>);
+
+fn raw_run_scope(it: &DisplayItem) -> RawRunScope {
+    (it.layer, it.clip, it.masks, it.group)
+}
+
 fn same_raw_run(a: &DisplayItem, b: &DisplayItem) -> bool {
-    a.layer == b.layer && a.clip == b.clip && a.masks == b.masks && a.group == b.group
+    raw_run_scope(a) == raw_run_scope(b)
 }
 
 fn same_raw_style(a: &DisplayItem, b: &DisplayItem) -> bool {
     a.transform.m[..4] == b.transform.m[..4] && a.stroke == b.stroke && a.color == b.color
 }
 
-/// Stage-space endpoints of every open subpath in `items`, indexed by `SNAP`-sized grid cells.
-/// Built over the whole contiguous raw-stroke run before partitioning by style so a three-way
-/// junction with another style or width still counts as degree >= 3.
-fn collect_raw_endpoints(items: &[DisplayItem]) -> HashMap<(i64, i64), Vec<Vec2>> {
+/// Whether `it`'s rendered stroke paint is fully opaque (alpha == 1 after colour transform).
+/// Opaque strokes overlapping away from a corner paint identically whether joined or separate;
+/// semi-transparent strokes darken where separate strokes overlap, so joining them would lose
+/// opacity at remote crossings.
+fn raw_stroke_opaque(it: &DisplayItem) -> bool {
+    it.stroke.as_ref().is_some_and(|st| it.color.apply(st.color).a >= 1.0)
+}
+
+/// Most segment-pair distance checks for one semi-transparent join candidate; past this budget we
+/// conservatively refuse the join rather than risk quadratic work on huge scribbles.
+const MAX_OVERLAP_CHECKS: usize = 262_144;
+
+fn flatten_raw_segs(start: Vec2, segs: impl IntoIterator<Item = RawSeg>, base_xf: &Affine, flat_tol: f32) -> Vec<(Vec2, Vec2)> {
+    let mut path = Path::new();
+    path.move_to(start);
+    for seg in segs {
+        seg.push_to(&mut path);
+    }
+    let mut out = Vec::new();
+    for pl in path.flatten(base_xf, flat_tol) {
+        for w in pl.points.windows(2) {
+            if let [a, b] = *w {
+                out.push((a, b));
+            }
+        }
+    }
+    out
+}
+
+/// Appends the sub-segments of `a`–`b` that lie outside the open disk of radius `r` around `c`.
+fn clip_seg_outside_disk(a: Vec2, b: Vec2, c: Vec2, r: f32, out: &mut Vec<(Vec2, Vec2)>) {
+    let r = f64::from(r);
+    let r2 = r * r;
+    let (ux, uy) = (f64::from(a.x) - f64::from(c.x), f64::from(a.y) - f64::from(c.y));
+    let (dx, dy) = (f64::from(b.x) - f64::from(a.x), f64::from(b.y) - f64::from(a.y));
+    let aa = dx * dx + dy * dy;
+    let cc = ux * ux + uy * uy - r2;
+    if aa <= 1e-18 {
+        if cc >= 0.0 {
+            out.push((a, b));
+        }
+        return;
+    }
+    let bb = ux * dx + uy * dy;
+    let disc = bb * bb - aa * cc;
+    if disc <= 0.0 {
+        out.push((a, b));
+        return;
+    }
+    let root = disc.sqrt();
+    let t0 = (-bb - root) / aa;
+    let t1 = (-bb + root) / aa;
+    if !(t0.is_finite() && t1.is_finite()) || t1 <= 0.0 || t0 >= 1.0 {
+        out.push((a, b));
+        return;
+    }
+    let at = |t: f64| Vec2::new((f64::from(a.x) + dx * t) as f32, (f64::from(a.y) + dy * t) as f32);
+    if t0 > 0.0 {
+        out.push((a, at(t0)));
+    }
+    if t1 < 1.0 {
+        out.push((at(t1), b));
+    }
+}
+
+fn clip_segs_outside_disks(segs: &[(Vec2, Vec2)], disks: &[Vec2], r: f32) -> Vec<(Vec2, Vec2)> {
+    let mut cur: Vec<(Vec2, Vec2)> = segs.to_vec();
+    let mut next: Vec<(Vec2, Vec2)> = Vec::with_capacity(cur.len());
+    for &c in disks {
+        next.clear();
+        for &(a, b) in &cur {
+            clip_seg_outside_disk(a, b, c, r, &mut next);
+        }
+        std::mem::swap(&mut cur, &mut next);
+    }
+    cur
+}
+
+fn segs_bounds(segs: &[(Vec2, Vec2)]) -> (Vec2, Vec2) {
+    let mut min = Vec2::new(f32::INFINITY, f32::INFINITY);
+    let mut max = Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &(a, b) in segs {
+        min.x = min.x.min(a.x).min(b.x);
+        min.y = min.y.min(a.y).min(b.y);
+        max.x = max.x.max(a.x).max(b.x);
+        max.y = max.y.max(a.y).max(b.y);
+    }
+    (min, max)
+}
+
+fn bounds_within(a: (Vec2, Vec2), b: (Vec2, Vec2), limit: f32) -> bool {
+    a.1.x + limit > b.0.x && b.1.x + limit > a.0.x && a.1.y + limit > b.0.y && b.1.y + limit > a.0.y
+}
+
+/// Whether segments `a0`–`a1` and `b0`–`b1` come strictly closer than `limit`.
+fn segs_closer_than(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2, limit: f32) -> bool {
+    let (ax0, ax1) = (a0.x.min(a1.x), a0.x.max(a1.x));
+    let (bx0, bx1) = (b0.x.min(b1.x), b0.x.max(b1.x));
+    if ax1 + limit <= bx0 || bx1 + limit <= ax0 {
+        return false;
+    }
+    let (ay0, ay1) = (a0.y.min(a1.y), a0.y.max(a1.y));
+    let (by0, by1) = (b0.y.min(b1.y), b0.y.max(b1.y));
+    if ay1 + limit <= by0 || by1 + limit <= ay0 {
+        return false;
+    }
+    if crossing(a0, a1, b0, b1).is_some() {
+        return true;
+    }
+    anicraft_geom::segment_distance(a0, b0, b1) < limit
+        || anicraft_geom::segment_distance(a1, b0, b1) < limit
+        || anicraft_geom::segment_distance(b0, a0, a1) < limit
+        || anicraft_geom::segment_distance(b1, a0, a1) < limit
+}
+
+/// Whether the flattened stage-space centrelines `a` and `b` come closer than `stage_width`
+/// anywhere outside the neighbourhood of the shared endpoint(s) `disks`.
+///
+/// The neighbourhood radius is `stage_width + SNAP` (rather than `half_width + SNAP`) so plain
+/// corners — including 90° L-corners and 60° triangle vertices, whose trimmed rays start
+/// `2·R·sin(θ/2)` apart — stay at least `stage_width` apart outside the disk while remote
+/// crossings or close approaches farther along the stroke are still caught.
+fn raw_remote_overlap(a: &[(Vec2, Vec2)], b: &[(Vec2, Vec2)], stage_width: f32, disks: &[Vec2]) -> bool {
+    let radius = stage_width + anicraft_geom::planar::SNAP;
+    let ta = clip_segs_outside_disks(a, disks, radius);
+    let tb = clip_segs_outside_disks(b, disks, radius);
+    if ta.is_empty() || tb.is_empty() {
+        return false;
+    }
+    if !bounds_within(segs_bounds(&ta), segs_bounds(&tb), stage_width) {
+        return false;
+    }
+    const CHUNK: usize = 16;
+    let b_chunks: Vec<_> = tb.chunks(CHUNK).map(|c| (c, segs_bounds(c))).collect();
+    let mut checks = 0usize;
+    for ac in ta.chunks(CHUNK) {
+        let ab = segs_bounds(ac);
+        for &(bc, bb) in &b_chunks {
+            if !bounds_within(ab, bb, stage_width) {
+                continue;
+            }
+            for &(a0, a1) in ac {
+                for &(b0, b1) in bc {
+                    checks += 1;
+                    if checks > MAX_OVERLAP_CHECKS {
+                        return true;
+                    }
+                    if segs_closer_than(a0, a1, b0, b1, stage_width) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Adds stage-space endpoints of every open subpath in `it` to `ends`, indexed by `SNAP`-sized
+/// grid cells. Called for every raw stroke in the same drawing scope (even across intervening
+/// fills or style changes) so a three-way junction with a stroke anywhere in the scope counts as
+/// degree >= 3.
+fn collect_item_raw_endpoints(it: &DisplayItem, ends: &mut HashMap<(i64, i64), Vec<Vec2>>) {
     let cell = anicraft_geom::planar::SNAP;
-    let mut ends: HashMap<(i64, i64), Vec<Vec2>> = HashMap::new();
     let mut push_open = |start: Vec2, end: Vec2| {
         if start.is_finite() && end.is_finite() {
             ends.entry(raw_grid_key(start, cell)).or_default().push(start);
             ends.entry(raw_grid_key(end, cell)).or_default().push(end);
         }
     };
-    for it in items {
-        let xf = &it.transform;
-        let mut item_ends: Vec<(Vec2, Vec2)> = Vec::new();
-        let mut start: Option<Vec2> = None;
-        let mut last = xf.apply(Vec2::ZERO);
-        let mut has_seg = false;
-        let mut finite = true;
-        for cmd in &it.path.cmds {
-            match *cmd {
-                PathCmd::MoveTo(p) => {
-                    if let Some(s) = start.take() && has_seg {
-                        item_ends.push((s, last));
-                    }
-                    let q = xf.apply(p);
-                    if !q.is_finite() {
-                        finite = false;
-                        break;
-                    }
-                    start = Some(q);
-                    last = q;
-                    has_seg = false;
+    let xf = &it.transform;
+    let mut item_ends: Vec<(Vec2, Vec2)> = Vec::new();
+    let mut start: Option<Vec2> = None;
+    let mut last = xf.apply(Vec2::ZERO);
+    let mut has_seg = false;
+    let mut finite = true;
+    for cmd in &it.path.cmds {
+        match *cmd {
+            PathCmd::MoveTo(p) => {
+                if let Some(s) = start.take() && has_seg {
+                    item_ends.push((s, last));
                 }
-                PathCmd::LineTo(p) => {
-                    let q = xf.apply(p);
-                    if !q.is_finite() {
-                        finite = false;
-                        break;
-                    }
-                    start.get_or_insert(last);
-                    last = q;
-                    has_seg = true;
+                let q = xf.apply(p);
+                if !q.is_finite() {
+                    finite = false;
+                    break;
                 }
-                PathCmd::QuadTo(c, p) => {
-                    let (c, q) = (xf.apply(c), xf.apply(p));
-                    if !(c.is_finite() && q.is_finite()) {
-                        finite = false;
-                        break;
-                    }
-                    start.get_or_insert(last);
-                    last = q;
-                    has_seg = true;
+                start = Some(q);
+                last = q;
+                has_seg = false;
+            }
+            PathCmd::LineTo(p) => {
+                let q = xf.apply(p);
+                if !q.is_finite() {
+                    finite = false;
+                    break;
                 }
-                PathCmd::CubicTo(c1, c2, p) => {
-                    let (c1, c2, q) = (xf.apply(c1), xf.apply(c2), xf.apply(p));
-                    if !(c1.is_finite() && c2.is_finite() && q.is_finite()) {
-                        finite = false;
-                        break;
-                    }
-                    start.get_or_insert(last);
-                    last = q;
-                    has_seg = true;
+                start.get_or_insert(last);
+                last = q;
+                has_seg = true;
+            }
+            PathCmd::QuadTo(c, p) => {
+                let (c, q) = (xf.apply(c), xf.apply(p));
+                if !(c.is_finite() && q.is_finite()) {
+                    finite = false;
+                    break;
                 }
-                PathCmd::Close => {
-                    if let Some(s) = start.take() {
-                        last = s;
-                    }
-                    has_seg = false;
+                start.get_or_insert(last);
+                last = q;
+                has_seg = true;
+            }
+            PathCmd::CubicTo(c1, c2, p) => {
+                let (c1, c2, q) = (xf.apply(c1), xf.apply(c2), xf.apply(p));
+                if !(c1.is_finite() && c2.is_finite() && q.is_finite()) {
+                    finite = false;
+                    break;
                 }
+                start.get_or_insert(last);
+                last = q;
+                has_seg = true;
+            }
+            PathCmd::Close => {
+                if let Some(s) = start.take() {
+                    last = s;
+                }
+                has_seg = false;
             }
         }
-        if !finite {
-            continue;
-        }
-        if let Some(s) = start && has_seg {
-            item_ends.push((s, last));
-        }
-        for (s, e) in item_ends {
-            push_open(s, e);
-        }
     }
-    ends
+    if !finite {
+        return;
+    }
+    if let Some(s) = start && has_seg {
+        item_ends.push((s, last));
+    }
+    for (s, e) in item_ends {
+        push_open(s, e);
+    }
 }
 
 fn extract_raw_subs(path: &Path, into: &Affine, item: usize) -> Option<Vec<RawSub>> {
@@ -1041,7 +1201,7 @@ fn raw_chain_find(
 }
 
 /// Chains open subpaths of the contiguous compatible run `range` (same style, linear transform and
-/// colour transform) at plain degree-2 corners using the whole raw run's stage-space endpoint table
+/// colour transform) at plain degree-2 corners using the drawing scope's stage-space endpoint table
 /// `ends`; returns `None` when nothing joins.
 fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap<(i64, i64), Vec<Vec2>>) -> Option<Vec<(usize, DisplayItem)>> {
     let base = dl.items.get(range.start)?;
@@ -1083,6 +1243,22 @@ fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap
             grid.entry(b).or_default().push(i);
         }
     }
+    let opaque = raw_stroke_opaque(base);
+    let stage_width = base.stroke.as_ref().map_or(0.0, |st| st.width * scale);
+    let flat_tol = (stage_width * 0.05).clamp(0.1, 0.5);
+    let check_overlap = |cand: &RawSub, matched_start: bool, join_pt: Vec2, other_chain_pt: Vec2, cur_flat: &[(Vec2, Vec2)]| -> Option<Vec<(Vec2, Vec2)>> {
+        let nf = flatten_raw_segs(cand.start, cand.segs.iter().copied(), &base_xf, flat_tol);
+        let other_end = base_xf.apply(if matched_start { cand.end() } else { cand.start });
+        let closes = other_end.distance(other_chain_pt) <= tol
+            && raw_plain_corner(ends, other_chain_pt)
+            && raw_plain_corner(ends, other_end);
+        let overlap = if closes {
+            raw_remote_overlap(cur_flat, &nf, stage_width, &[join_pt, other_chain_pt])
+        } else {
+            raw_remote_overlap(cur_flat, &nf, stage_width, &[join_pt])
+        };
+        (!overlap).then_some(nf)
+    };
     let mut slots: Vec<Option<RawSub>> = open.into_iter().map(Some).collect();
     let mut joined_any = false;
     let mut paths: Vec<(usize, Path)> = Vec::new();
@@ -1094,11 +1270,18 @@ fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap
         let mut start = cur.start;
         let mut segs: VecDeque<RawSeg> = VecDeque::from(cur.segs);
         let mut closed = false;
+        let mut chained = false;
+        let mut tail_blocked = false;
+        let mut head_blocked = false;
+        let mut cur_flat: Option<Vec<(Vec2, Vec2)>> = None;
         loop {
             let tail = segs.back().map_or(start, |g| g.end());
             let start_stage = base_xf.apply(start);
             let tail_stage = base_xf.apply(tail);
-            if segs.len() > 1
+            // Only close a loop that actually consumed another subpath; a single nearly-closed
+            // open path must stay open and keep its caps even when another pair in the run joins.
+            if chained
+                && segs.len() > 1
                 && tail_stage.distance(start_stage) <= tol
                 && raw_plain_corner(ends, start_stage)
                 && raw_plain_corner(ends, tail_stage)
@@ -1106,28 +1289,64 @@ fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap
                 closed = true;
                 break;
             }
-            if raw_plain_corner(ends, tail_stage)
+            if !tail_blocked
+                && raw_plain_corner(ends, tail_stage)
                 && let Some((j, matched_start)) = raw_chain_find(&mut grid, ends, &slots, &base_xf, tail_stage)
-                && let Some(next) = slots.get_mut(j).and_then(Option::take)
             {
-                let next = if matched_start { next } else { next.reverse() };
-                max_item = max_item.max(next.item);
-                segs.extend(next.segs);
-                joined_any = true;
-                continue;
-            }
-            if raw_plain_corner(ends, start_stage)
-                && let Some((j, matched_start)) = raw_chain_find(&mut grid, ends, &slots, &base_xf, start_stage)
-                && let Some(prev) = slots.get_mut(j).and_then(Option::take)
-            {
-                let prev = if matched_start { prev.reverse() } else { prev };
-                max_item = max_item.max(prev.item);
-                start = prev.start;
-                for g in prev.segs.into_iter().rev() {
-                    segs.push_front(g);
+                let mut accepted = true;
+                let mut cand_flat = None;
+                if !opaque && let Some(cand) = slots.get(j).and_then(Option::as_ref) {
+                    let cf = cur_flat.get_or_insert_with(|| flatten_raw_segs(start, segs.iter().copied(), &base_xf, flat_tol));
+                    match check_overlap(cand, matched_start, tail_stage, start_stage, cf) {
+                        Some(nf) => cand_flat = Some(nf),
+                        None => {
+                            accepted = false;
+                            tail_blocked = true;
+                        }
+                    }
                 }
-                joined_any = true;
-                continue;
+                if accepted && let Some(next) = slots.get_mut(j).and_then(Option::take) {
+                    let next = if matched_start { next } else { next.reverse() };
+                    max_item = max_item.max(next.item);
+                    segs.extend(next.segs);
+                    if let (Some(cf), Some(nf)) = (cur_flat.as_mut(), cand_flat) {
+                        cf.extend(nf);
+                    }
+                    chained = true;
+                    joined_any = true;
+                    continue;
+                }
+            }
+            if !head_blocked
+                && raw_plain_corner(ends, start_stage)
+                && let Some((j, matched_start)) = raw_chain_find(&mut grid, ends, &slots, &base_xf, start_stage)
+            {
+                let mut accepted = true;
+                let mut cand_flat = None;
+                if !opaque && let Some(cand) = slots.get(j).and_then(Option::as_ref) {
+                    let cf = cur_flat.get_or_insert_with(|| flatten_raw_segs(start, segs.iter().copied(), &base_xf, flat_tol));
+                    match check_overlap(cand, matched_start, start_stage, tail_stage, cf) {
+                        Some(nf) => cand_flat = Some(nf),
+                        None => {
+                            accepted = false;
+                            head_blocked = true;
+                        }
+                    }
+                }
+                if accepted && let Some(prev) = slots.get_mut(j).and_then(Option::take) {
+                    let prev = if matched_start { prev.reverse() } else { prev };
+                    max_item = max_item.max(prev.item);
+                    start = prev.start;
+                    for g in prev.segs.into_iter().rev() {
+                        segs.push_front(g);
+                    }
+                    if let (Some(cf), Some(nf)) = (cur_flat.as_mut(), cand_flat) {
+                        cf.extend(nf);
+                    }
+                    chained = true;
+                    joined_any = true;
+                    continue;
+                }
             }
             break;
         }
@@ -1170,9 +1389,26 @@ pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
     let compatible_pair = |a: &DisplayItem, b: &DisplayItem| {
         is_joinable_raw_stroke(a) && is_joinable_raw_stroke(b) && same_raw_run(a, b) && same_raw_style(a, b) && a.transform.inverse().is_some()
     };
-    let has_pair = dl.items.windows(2).any(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| compatible_pair(a, b)));
-    if !has_pair {
+    let mut active_scopes: HashSet<RawRunScope> = HashSet::new();
+    for w in dl.items.windows(2) {
+        if let (Some(a), Some(b)) = (w.first(), w.get(1)) && compatible_pair(a, b) {
+            active_scopes.insert(raw_run_scope(a));
+        }
+    }
+    if active_scopes.is_empty() {
         return std::borrow::Cow::Borrowed(dl);
+    }
+    // Count endpoint degrees over every raw stroke in the same drawing scope (even across
+    // intervening fills or other items), while still only choosing join candidates within a
+    // contiguous raw-stroke run.
+    let mut scope_ends: HashMap<RawRunScope, HashMap<(i64, i64), Vec<Vec2>>> = HashMap::with_capacity(active_scopes.len());
+    for it in &dl.items {
+        if is_raw_stroke(it) {
+            let scope = raw_run_scope(it);
+            if active_scopes.contains(&scope) {
+                collect_item_raw_endpoints(it, scope_ends.entry(scope).or_default());
+            }
+        }
     }
     let mut replacements = Vec::new();
     let mut i = 0;
@@ -1192,7 +1428,7 @@ pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
         if !run_slice.windows(2).any(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| compatible_pair(a, b))) {
             continue;
         }
-        let ends = collect_raw_endpoints(run_slice);
+        let Some(ends) = scope_ends.get(&raw_run_scope(first)) else { continue };
         let mut j = run_start;
         while j < run_end {
             let Some(head) = dl.items.get(j) else { break };
@@ -1208,7 +1444,7 @@ pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
             }
             j = sub_end;
             if sub_end - sub_start >= 2
-                && let Some(chained) = chain_raw_run(dl, sub_start..sub_end, &ends)
+                && let Some(chained) = chain_raw_run(dl, sub_start..sub_end, ends)
             {
                 replacements.push((sub_start..sub_end, chained));
             }
@@ -1696,5 +1932,112 @@ mod tests {
         assert_eq!(joined.items.len(), 2);
         assert_eq!(joined.links.len(), 1);
         assert_eq!(joined.links[0].0, 1, "link index shifts from 2 to 1 after the first two strokes merge");
+    }
+
+    #[test]
+    fn raw_join_keeps_nearly_closed_open_path_open_alongside_joined_pair() {
+        // A single open path whose endpoints sit within SNAP (0.1 <= 0.2) alongside a distant
+        // right-angle pair in the same style run: the distant pair joins, while the open path
+        // must stay open and keep its caps (its outline matches outlining it alone).
+        let black = anicraft_doc::Rgba::BLACK;
+        let make = |path: &str| {
+            let st = Stroke::new(black, 10.0).with_style(anicraft_doc::StrokeStyle { cap: Cap::Square, join: Join::Miter, ..Default::default() });
+            DisplayItem { stroke: Some(st), ..raw_stroke_item(path, black, 10.0, Join::Miter) }
+        };
+        let nearly_closed = make("M 20 20 L 60 20 L 60 60 L 20 20.1");
+        let dl = raw_dl(vec![
+            nearly_closed.clone(),
+            make("M 200 20 L 240 20"),
+            make("M 240 20 L 240 60"),
+        ]);
+        let joined = join_raw_strokes(&dl);
+        assert_eq!(joined.items.len(), 2, "distant right-angle pair joins into one item");
+        let kept = &joined.items[0];
+        assert!(!kept.path.cmds.iter().any(|c| matches!(c, PathCmd::Close)), "nearly-closed open path must not be closed");
+        let st = nearly_closed.stroke.as_ref().unwrap();
+        let alone = stroke_outline(&nearly_closed.path, &nearly_closed.transform, st, crate::TOLERANCE);
+        let after = stroke_outline(&kept.path, &kept.transform, kept.stroke.as_ref().unwrap(), crate::TOLERANCE);
+        assert_eq!(after.cmds, alone.cmds, "unjoined open path must keep the exact same caps and outline");
+    }
+
+    #[test]
+    fn raw_join_preserves_semi_transparent_overlap_away_from_corner() {
+        let half = anicraft_doc::Rgba::new(0.0, 0.0, 0.0, 0.5);
+        let black = anicraft_doc::Rgba::BLACK;
+        // Two strokes sharing (20, 20) and crossing again at (70, 70).
+        let a_path = "M 20 20 L 120 20 L 20 120";
+        let b_path = "M 20 20 L 20 70 L 120 70";
+
+        let semi_cross = raw_dl(vec![
+            raw_stroke_item(a_path, half, 12.0, Join::Miter),
+            raw_stroke_item(b_path, half, 12.0, Join::Miter),
+        ]);
+        let joined_semi = join_raw_strokes(&semi_cross);
+        assert!(matches!(joined_semi, std::borrow::Cow::Borrowed(_)), "semi-transparent strokes that cross away from the corner must stay separate");
+        assert_eq!(joined_semi.items.len(), 2);
+        // Rendered crossing pixel (70, 70) must be darker than a single-stroke pixel (80, 20).
+        let view = crate::View { transform: Affine::IDENTITY, width: 140, height: 140, background: Some(anicraft_doc::Rgba::WHITE) };
+        let (pm, _) = crate::render(&semi_cross, &view).unwrap();
+        let single = pm.pixel(80, 20).unwrap();
+        let crossing_px = pm.pixel(70, 70).unwrap();
+        assert!(crossing_px[0] < single[0] - 0.15, "crossing must double-blend darker than a single stroke: cross={crossing_px:?}, single={single:?}");
+
+        // Same crossing pair with opaque stroke colour but semi-transparent ColorTransform also stays separate.
+        let mut ct_a = raw_stroke_item(a_path, black, 12.0, Join::Miter);
+        let mut ct_b = raw_stroke_item(b_path, black, 12.0, Join::Miter);
+        ct_a.color = anicraft_doc::ColorTransform::alpha(0.5);
+        ct_b.color = anicraft_doc::ColorTransform::alpha(0.5);
+        assert!(matches!(join_raw_strokes(&raw_dl(vec![ct_a, ct_b])), std::borrow::Cow::Borrowed(_)), "semi-transparent ColorTransform must also keep crossing strokes separate");
+
+        // Same crossing pair when fully opaque still joins.
+        let opaque_cross = raw_dl(vec![
+            raw_stroke_item(a_path, black, 12.0, Join::Miter),
+            raw_stroke_item(b_path, black, 12.0, Join::Miter),
+        ]);
+        let joined_opaque = join_raw_strokes(&opaque_cross);
+        assert_eq!(joined_opaque.items.len(), 1, "opaque crossing pair still joins");
+
+        // Semi-transparent L-corner with no remote overlap still joins.
+        let semi_l = raw_dl(vec![
+            raw_stroke_item("M 20 20 L 100 20", half, 12.0, Join::Miter),
+            raw_stroke_item("M 100 20 L 100 100", half, 12.0, Join::Miter),
+        ]);
+        let joined_l = join_raw_strokes(&semi_l);
+        assert_eq!(joined_l.items.len(), 1, "semi-transparent L-corner without remote overlap still joins");
+    }
+
+    #[test]
+    fn raw_join_counts_third_branch_across_intervening_fill() {
+        // Stroke A and stroke B meet at (100, 100), followed by a distant fill-only item, then
+        // stroke C meeting the same corner on the same drawing scope: degree is 3, so A and B
+        // must not join.
+        let black = anicraft_doc::Rgba::BLACK;
+        let fill_only = DisplayItem {
+            path: Arc::new(Path::from_svg("M 300 300 L 340 300 L 340 340 Z").unwrap()),
+            fill: Some(anicraft_doc::Paint::Solid(anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 1.0))),
+            stroke: None,
+            ..raw_stroke_item("M 0 0 L 1 0", black, 10.0, Join::Miter)
+        };
+        let dl = raw_dl(vec![
+            raw_stroke_item("M 0 100 L 100 100", black, 10.0, Join::Miter),
+            raw_stroke_item("M 100 100 L 100 200", black, 10.0, Join::Miter),
+            fill_only.clone(),
+            raw_stroke_item("M 100 100 L 200 100", black, 10.0, Join::Miter),
+        ]);
+        let joined = join_raw_strokes(&dl);
+        assert!(matches!(joined, std::borrow::Cow::Borrowed(_)), "third branch after an intervening fill must prevent joining A and B");
+        assert_eq!(joined.items.len(), 4);
+
+        // If the third stroke is on a different layer (different drawing scope), A and B still join.
+        let mut other_layer_c = raw_stroke_item("M 100 100 L 200 100", black, 10.0, Join::Miter);
+        other_layer_c.layer = anicraft_doc::LayerId(1);
+        let dl_other = raw_dl(vec![
+            raw_stroke_item("M 0 100 L 100 100", black, 10.0, Join::Miter),
+            raw_stroke_item("M 100 100 L 100 200", black, 10.0, Join::Miter),
+            fill_only,
+            other_layer_c,
+        ]);
+        let joined_other = join_raw_strokes(&dl_other);
+        assert_eq!(joined_other.items.len(), 3, "stroke on another layer must not block joining A and B");
     }
 }
