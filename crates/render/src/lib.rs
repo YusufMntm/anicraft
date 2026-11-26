@@ -149,8 +149,8 @@ pub fn render(dl: &DisplayList, view: &View) -> Result<(Pixmap, RenderStats), Re
 /// [`render`]; `cut` off prepares every item whole (see [`unseen`]), which draws the same
 /// pixels more slowly: the tests compare the two.
 fn render_cut(dl: &DisplayList, view: &View, cut: bool) -> Result<(Pixmap, RenderStats), RenderError> {
-    let dl = &*stroke::join_raw_strokes(dl);
     let mut pm = Pixmap::new(view.width, view.height)?;
+    let dl = &*stroke::join_raw_strokes(dl);
     // The background is filled band by band, in parallel, just before each band draws (a
     // serial fill of a 1080p float buffer cost as much as all the drawing).
     let background = view.background.map(premultiply);

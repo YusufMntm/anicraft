@@ -792,38 +792,111 @@ impl RawSub {
     }
 }
 
-fn is_joinable_raw_stroke(it: &DisplayItem) -> bool {
+fn is_raw_stroke(it: &DisplayItem) -> bool {
     it.merge
         && it.fill.is_none()
         && it.outline.is_none()
         && !it.guide
         && it.warp.is_none()
         && it.transform.is_finite()
-        && it.stroke.as_ref().is_some_and(|st| st.profile.is_none() && st.width.is_finite() && st.width > 0.0)
+        && it.stroke.as_ref().is_some_and(|st| st.width.is_finite() && st.width > 0.0)
+}
+
+fn is_joinable_raw_stroke(it: &DisplayItem) -> bool {
+    is_raw_stroke(it) && it.stroke.as_ref().is_some_and(|st| st.profile.is_none())
 }
 
 fn same_raw_run(a: &DisplayItem, b: &DisplayItem) -> bool {
     a.layer == b.layer && a.clip == b.clip && a.masks == b.masks && a.group == b.group
 }
 
-fn raw_bucket_hash(it: &DisplayItem) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let bits = |v: f32| if v == 0.0 { 0u32 } else { v.to_bits() };
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for &v in &it.transform.m[..4] {
-        bits(v).hash(&mut h);
+fn same_raw_style(a: &DisplayItem, b: &DisplayItem) -> bool {
+    a.transform.m[..4] == b.transform.m[..4] && a.stroke == b.stroke && a.color == b.color
+}
+
+/// Stage-space endpoints of every open subpath in `items`, indexed by `SNAP`-sized grid cells.
+/// Built over the whole contiguous raw-stroke run before partitioning by style so a three-way
+/// junction with another style or width still counts as degree >= 3.
+fn collect_raw_endpoints(items: &[DisplayItem]) -> HashMap<(i64, i64), Vec<Vec2>> {
+    let cell = anicraft_geom::planar::SNAP;
+    let mut ends: HashMap<(i64, i64), Vec<Vec2>> = HashMap::new();
+    let mut push_open = |start: Vec2, end: Vec2| {
+        if start.is_finite() && end.is_finite() {
+            ends.entry(raw_grid_key(start, cell)).or_default().push(start);
+            ends.entry(raw_grid_key(end, cell)).or_default().push(end);
+        }
+    };
+    for it in items {
+        let xf = &it.transform;
+        let mut item_ends: Vec<(Vec2, Vec2)> = Vec::new();
+        let mut start: Option<Vec2> = None;
+        let mut last = xf.apply(Vec2::ZERO);
+        let mut has_seg = false;
+        let mut finite = true;
+        for cmd in &it.path.cmds {
+            match *cmd {
+                PathCmd::MoveTo(p) => {
+                    if let Some(s) = start.take() && has_seg {
+                        item_ends.push((s, last));
+                    }
+                    let q = xf.apply(p);
+                    if !q.is_finite() {
+                        finite = false;
+                        break;
+                    }
+                    start = Some(q);
+                    last = q;
+                    has_seg = false;
+                }
+                PathCmd::LineTo(p) => {
+                    let q = xf.apply(p);
+                    if !q.is_finite() {
+                        finite = false;
+                        break;
+                    }
+                    start.get_or_insert(last);
+                    last = q;
+                    has_seg = true;
+                }
+                PathCmd::QuadTo(c, p) => {
+                    let (c, q) = (xf.apply(c), xf.apply(p));
+                    if !(c.is_finite() && q.is_finite()) {
+                        finite = false;
+                        break;
+                    }
+                    start.get_or_insert(last);
+                    last = q;
+                    has_seg = true;
+                }
+                PathCmd::CubicTo(c1, c2, p) => {
+                    let (c1, c2, q) = (xf.apply(c1), xf.apply(c2), xf.apply(p));
+                    if !(c1.is_finite() && c2.is_finite() && q.is_finite()) {
+                        finite = false;
+                        break;
+                    }
+                    start.get_or_insert(last);
+                    last = q;
+                    has_seg = true;
+                }
+                PathCmd::Close => {
+                    if let Some(s) = start.take() {
+                        last = s;
+                    }
+                    has_seg = false;
+                }
+            }
+        }
+        if !finite {
+            continue;
+        }
+        if let Some(s) = start && has_seg {
+            item_ends.push((s, last));
+        }
+        for (s, e) in item_ends {
+            push_open(s, e);
+        }
     }
-    if let Some(st) = &it.stroke {
-        bits(st.width).hash(&mut h);
-        [st.color.r, st.color.g, st.color.b, st.color.a].map(bits).hash(&mut h);
-        let cap: u8 = match st.style.cap { Cap::Butt => 0, Cap::Round => 1, Cap::Square => 2 };
-        let join: u8 = match st.style.join { Join::Miter => 0, Join::Round => 1, Join::Bevel => 2 };
-        (cap, join, bits(st.style.miter_limit), st.style.dash.is_some()).hash(&mut h);
-    }
-    for v in it.color.mul.into_iter().chain(it.color.add) {
-        bits(v).hash(&mut h);
-    }
-    h.finish()
+    ends
 }
 
 fn extract_raw_subs(path: &Path, into: &Affine, item: usize) -> Option<Vec<RawSub>> {
@@ -894,10 +967,14 @@ fn raw_grid_key(v: Vec2, cell: f32) -> (i64, i64) {
     ((v.x / cell).floor() as i64, (v.y / cell).floor() as i64)
 }
 
-/// Whether exactly two open endpoints of `ends` lie within `tol` of `at`: a plain corner where
-/// two stroke runs meet with no ambiguity.
-fn raw_plain_corner(ends: &HashMap<(i64, i64), Vec<Vec2>>, at: Vec2, tol: f32, cell: f32) -> bool {
-    let (kx, ky) = raw_grid_key(at, cell);
+/// Whether exactly two open endpoints of `ends` lie within `SNAP` (stage units) of `at`: a plain
+/// corner where two stroke runs meet with no ambiguity.
+fn raw_plain_corner(ends: &HashMap<(i64, i64), Vec<Vec2>>, at: Vec2) -> bool {
+    if !at.is_finite() {
+        return false;
+    }
+    let tol = anicraft_geom::planar::SNAP;
+    let (kx, ky) = raw_grid_key(at, tol);
     let mut n = 0;
     for dx in -1..=1_i64 {
         for dy in -1..=1_i64 {
@@ -911,10 +988,21 @@ fn raw_plain_corner(ends: &HashMap<(i64, i64), Vec<Vec2>>, at: Vec2, tol: f32, c
     n == 2
 }
 
-/// The last remaining open subpath with an endpoint within `tol` of `at`.
-fn raw_chain_find(grid: &mut HashMap<(i64, i64), Vec<usize>>, slots: &[Option<RawSub>], at: Vec2, tol: f32, cell: f32) -> Option<usize> {
-    let (kx, ky) = raw_grid_key(at, cell);
-    let mut best: Option<usize> = None;
+/// The last remaining open subpath with an endpoint within `SNAP` (stage units) of `at` whose
+/// matched endpoint also passes [`raw_plain_corner`]. Returns `(slot_index, matched_start)`.
+fn raw_chain_find(
+    grid: &mut HashMap<(i64, i64), Vec<usize>>,
+    ends: &HashMap<(i64, i64), Vec<Vec2>>,
+    slots: &[Option<RawSub>],
+    base_xf: &Affine,
+    at: Vec2,
+) -> Option<(usize, bool)> {
+    if !at.is_finite() {
+        return None;
+    }
+    let tol = anicraft_geom::planar::SNAP;
+    let (kx, ky) = raw_grid_key(at, tol);
+    let mut best: Option<(usize, bool)> = None;
     for dx in -1..=1_i64 {
         for dy in -1..=1_i64 {
             let Some(list) = grid.get_mut(&(kx.saturating_add(dx), ky.saturating_add(dy))) else { continue };
@@ -930,11 +1018,20 @@ fn raw_chain_find(grid: &mut HashMap<(i64, i64), Vec<usize>>, slots: &[Option<Ra
                     }
                     continue;
                 };
-                if best.is_some_and(|b| b >= i) {
+                if best.is_some_and(|(b, _)| b >= i) {
                     break;
                 }
-                if s.start.distance(at) <= tol || s.end().distance(at) <= tol {
-                    best = Some(i);
+                let st = base_xf.apply(s.start);
+                let en = base_xf.apply(s.end());
+                let matched = if st.distance(at) <= tol {
+                    Some((true, st))
+                } else if en.distance(at) <= tol {
+                    Some((false, en))
+                } else {
+                    None
+                };
+                if let Some((matched_start, end_pt)) = matched && raw_plain_corner(ends, end_pt) {
+                    best = Some((i, matched_start));
                     break;
                 }
             }
@@ -943,24 +1040,23 @@ fn raw_chain_find(grid: &mut HashMap<(i64, i64), Vec<usize>>, slots: &[Option<Ra
     best
 }
 
-/// Chains open subpaths of `members` (same style, linear transform and colour transform) at plain
-/// degree-2 corners; returns `None` when nothing joins.
-fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, DisplayItem)>> {
-    let &first = members.first()?;
-    let base = dl.items.get(first)?;
+/// Chains open subpaths of the contiguous compatible run `range` (same style, linear transform and
+/// colour transform) at plain degree-2 corners using the whole raw run's stage-space endpoint table
+/// `ends`; returns `None` when nothing joins.
+fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap<(i64, i64), Vec<Vec2>>) -> Option<Vec<(usize, DisplayItem)>> {
+    let base = dl.items.get(range.start)?;
     let base_xf = base.transform;
     let inv = base_xf.inverse()?;
     let scale = base_xf.mean_scale();
     if !(scale.is_finite() && scale > 1e-6) {
         return None;
     }
-    let tol = anicraft_geom::planar::SNAP / scale;
-    let cell = if tol.is_finite() && tol > 0.0 { tol } else { 1.0 };
+    let tol = anicraft_geom::planar::SNAP;
 
-    let mut unchanged: Vec<(usize, DisplayItem)> = Vec::new();
+    let mut unchanged: Vec<usize> = Vec::new();
     let mut closed_extra: Vec<RawSub> = Vec::new();
     let mut open: Vec<RawSub> = Vec::new();
-    for &idx in members {
+    for idx in range {
         let it = dl.items.get(idx)?;
         let into = inv.mul(&it.transform);
         if !into.is_finite() {
@@ -968,7 +1064,7 @@ fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, D
         }
         let subs = extract_raw_subs(&it.path, &into, idx)?;
         if !subs.iter().any(|s| !s.closed) {
-            unchanged.push((idx, it.clone()));
+            unchanged.push(idx);
             continue;
         }
         for s in subs {
@@ -980,19 +1076,16 @@ fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, D
     }
     open.reverse(); // popped in drawing order
     let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-    let mut ends: HashMap<(i64, i64), Vec<Vec2>> = HashMap::new();
     for (i, s) in open.iter().enumerate() {
-        let (a, b) = (raw_grid_key(s.start, cell), raw_grid_key(s.end(), cell));
+        let (a, b) = (raw_grid_key(base_xf.apply(s.start), tol), raw_grid_key(base_xf.apply(s.end()), tol));
         grid.entry(a).or_default().push(i);
         if b != a {
             grid.entry(b).or_default().push(i);
         }
-        ends.entry(a).or_default().push(s.start);
-        ends.entry(b).or_default().push(s.end());
     }
     let mut slots: Vec<Option<RawSub>> = open.into_iter().map(Some).collect();
     let mut joined_any = false;
-    let mut built: Vec<(usize, DisplayItem)> = Vec::new();
+    let mut paths: Vec<(usize, Path)> = Vec::new();
     while let Some(cur) = slots.iter_mut().rev().find_map(Option::take) {
         while matches!(slots.last(), Some(None)) {
             slots.pop();
@@ -1003,23 +1096,31 @@ fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, D
         let mut closed = false;
         loop {
             let tail = segs.back().map_or(start, |g| g.end());
-            if segs.len() > 1 && tail.distance(start) <= tol {
+            let start_stage = base_xf.apply(start);
+            let tail_stage = base_xf.apply(tail);
+            if segs.len() > 1
+                && tail_stage.distance(start_stage) <= tol
+                && raw_plain_corner(ends, start_stage)
+                && raw_plain_corner(ends, tail_stage)
+            {
                 closed = true;
                 break;
             }
-            if raw_plain_corner(&ends, tail, tol, cell)
-                && let Some(next) = raw_chain_find(&mut grid, &slots, tail, tol, cell).and_then(|j| slots.get_mut(j)?.take())
+            if raw_plain_corner(ends, tail_stage)
+                && let Some((j, matched_start)) = raw_chain_find(&mut grid, ends, &slots, &base_xf, tail_stage)
+                && let Some(next) = slots.get_mut(j).and_then(Option::take)
             {
-                let next = if next.start.distance(tail) <= tol { next } else { next.reverse() };
+                let next = if matched_start { next } else { next.reverse() };
                 max_item = max_item.max(next.item);
                 segs.extend(next.segs);
                 joined_any = true;
                 continue;
             }
-            if raw_plain_corner(&ends, start, tol, cell)
-                && let Some(prev) = raw_chain_find(&mut grid, &slots, start, tol, cell).and_then(|j| slots.get_mut(j)?.take())
+            if raw_plain_corner(ends, start_stage)
+                && let Some((j, matched_start)) = raw_chain_find(&mut grid, ends, &slots, &base_xf, start_stage)
+                && let Some(prev) = slots.get_mut(j).and_then(Option::take)
             {
-                let prev = if prev.end().distance(start) <= tol { prev } else { prev.reverse() };
+                let prev = if matched_start { prev.reverse() } else { prev };
                 max_item = max_item.max(prev.item);
                 start = prev.start;
                 for g in prev.segs.into_iter().rev() {
@@ -1029,9 +1130,6 @@ fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, D
                 continue;
             }
             break;
-        }
-        if !closed && segs.len() > 1 && segs.back().is_some_and(|g| g.end().distance(start) <= tol) {
-            closed = true;
         }
         if closed && let Some(last) = segs.back_mut() {
             last.set_end(start);
@@ -1044,15 +1142,23 @@ fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, D
         if closed {
             path.close();
         }
-        built.push((max_item, DisplayItem { path: Arc::new(path), transform: base_xf, ..base.clone() }));
+        paths.push((max_item, path));
     }
     if !joined_any {
         return None;
     }
+    let mut built: Vec<(usize, DisplayItem)> = Vec::with_capacity(paths.len() + closed_extra.len() + unchanged.len());
+    for (max_item, path) in paths {
+        built.push((max_item, DisplayItem { path: Arc::new(path), transform: base_xf, ..base.clone() }));
+    }
     for sub in closed_extra {
         built.push((sub.item, DisplayItem { path: Arc::new(sub.to_path()), transform: base_xf, ..base.clone() }));
     }
-    built.extend(unchanged);
+    for idx in unchanged {
+        if let Some(it) = dl.items.get(idx) {
+            built.push((idx, it.clone()));
+        }
+    }
     Some(built)
 }
 
@@ -1061,96 +1167,90 @@ fn chain_raw_bucket(dl: &DisplayList, members: &[usize]) -> Option<Vec<(usize, D
 /// render across the separate stroke elements merge drawing splits at corners (ADR 0031, 0046).
 /// Borrowed unchanged when no raw strokes join.
 pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
-    let has_pair = dl.items.windows(2).any(|w| {
-        w.first().zip(w.get(1)).is_some_and(|(a, b)| is_joinable_raw_stroke(a) && is_joinable_raw_stroke(b) && same_raw_run(a, b))
-    });
+    let compatible_pair = |a: &DisplayItem, b: &DisplayItem| {
+        is_joinable_raw_stroke(a) && is_joinable_raw_stroke(b) && same_raw_run(a, b) && same_raw_style(a, b) && a.transform.inverse().is_some()
+    };
+    let has_pair = dl.items.windows(2).any(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| compatible_pair(a, b)));
     if !has_pair {
+        return std::borrow::Cow::Borrowed(dl);
+    }
+    let mut replacements = Vec::new();
+    let mut i = 0;
+    while i < dl.items.len() {
+        let Some(first) = dl.items.get(i) else { break };
+        if !is_raw_stroke(first) {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut run_end = i + 1;
+        while let Some(next) = dl.items.get(run_end) {
+            if is_raw_stroke(next) && same_raw_run(first, next) { run_end += 1; } else { break; }
+        }
+        i = run_end;
+        let run_slice = dl.items.get(run_start..run_end).unwrap_or_default();
+        if !run_slice.windows(2).any(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| compatible_pair(a, b))) {
+            continue;
+        }
+        let ends = collect_raw_endpoints(run_slice);
+        let mut j = run_start;
+        while j < run_end {
+            let Some(head) = dl.items.get(j) else { break };
+            if !is_joinable_raw_stroke(head) || head.transform.inverse().is_none() {
+                j += 1;
+                continue;
+            }
+            let sub_start = j;
+            let mut sub_end = j + 1;
+            while sub_end < run_end {
+                let Some(next) = dl.items.get(sub_end) else { break };
+                if is_joinable_raw_stroke(next) && same_raw_style(head, next) { sub_end += 1; } else { break; }
+            }
+            j = sub_end;
+            if sub_end - sub_start >= 2
+                && let Some(chained) = chain_raw_run(dl, sub_start..sub_end, &ends)
+            {
+                replacements.push((sub_start..sub_end, chained));
+            }
+        }
+    }
+    if replacements.is_empty() {
         return std::borrow::Cow::Borrowed(dl);
     }
     let mut items: Vec<DisplayItem> = Vec::with_capacity(dl.items.len());
     let track_links = !dl.links.is_empty();
     let mut remap: Vec<Option<u32>> = if track_links { vec![None; dl.items.len()] } else { Vec::new() };
-    let mut any_changed = false;
-    let mut i = 0;
-    while i < dl.items.len() {
-        let Some(first) = dl.items.get(i) else { break };
-        if !is_joinable_raw_stroke(first) {
-            if let Some(slot) = remap.get_mut(i) {
+    let mut cursor = 0;
+    for (range, chained) in replacements {
+        for idx in cursor..range.start {
+            if let Some(slot) = remap.get_mut(idx) {
                 *slot = u32::try_from(items.len()).ok();
             }
-            items.push(first.clone());
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let mut end = i + 1;
-        while let Some(next) = dl.items.get(end) {
-            if is_joinable_raw_stroke(next) && same_raw_run(first, next) { end += 1; } else { break; }
-        }
-        if end - start < 2 {
-            if let Some(slot) = remap.get_mut(start) {
-                *slot = u32::try_from(items.len()).ok();
-            }
-            items.push(first.clone());
-            i = end;
-            continue;
-        }
-        // Group items in this contiguous run by style, linear transform and colour transform.
-        let mut buckets: Vec<Vec<usize>> = Vec::new();
-        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-        for idx in start..end {
-            let Some(it) = dl.items.get(idx) else { continue };
-            let key = it.transform.inverse().map(|_| raw_bucket_hash(it));
-            let found = key.and_then(|k| {
-                by_hash.get(&k).and_then(|cands| {
-                    cands.iter().copied().find(|&bi| {
-                        buckets.get(bi).and_then(|b| b.first()).and_then(|&j| dl.items.get(j)).is_some_and(|rep| {
-                            rep.transform.inverse().is_some() && rep.transform.m[..4] == it.transform.m[..4] && rep.stroke == it.stroke && rep.color == it.color
-                        })
-                    })
-                })
-            });
-            match found {
-                Some(bi) => {
-                    if let Some(b) = buckets.get_mut(bi) { b.push(idx); }
-                }
-                None => {
-                    if let Some(k) = key {
-                        by_hash.entry(k).or_default().push(buckets.len());
-                    }
-                    buckets.push(vec![idx]);
-                }
+            if let Some(it) = dl.items.get(idx) {
+                items.push(it.clone());
             }
         }
-        let mut emitted: Vec<Vec<DisplayItem>> = vec![Vec::new(); end - start];
-        for bucket in &buckets {
-            if bucket.len() >= 2
-                && let Some(chained) = chain_raw_bucket(dl, bucket)
-            {
-                any_changed = true;
-                for (slot_idx, it) in chained {
-                    if let Some(slot) = emitted.get_mut(slot_idx.saturating_sub(start)) {
-                        slot.push(it);
-                    }
-                }
-            } else {
-                for &idx in bucket {
-                    if let (Some(slot), Some(it)) = (emitted.get_mut(idx.saturating_sub(start)), dl.items.get(idx)) {
-                        slot.push(it.clone());
-                    }
-                }
+        let mut emitted: Vec<Vec<DisplayItem>> = vec![Vec::new(); range.len()];
+        for (slot_idx, it) in chained {
+            if let Some(slot) = emitted.get_mut(slot_idx.saturating_sub(range.start)) {
+                slot.push(it);
             }
         }
         for (off, list) in emitted.into_iter().enumerate() {
-            if let Some(slot) = remap.get_mut(start + off) {
+            if let Some(slot) = remap.get_mut(range.start + off) {
                 *slot = u32::try_from(items.len()).ok();
             }
             items.extend(list);
         }
-        i = end;
+        cursor = range.end;
     }
-    if !any_changed {
-        return std::borrow::Cow::Borrowed(dl);
+    for idx in cursor..dl.items.len() {
+        if let Some(slot) = remap.get_mut(idx) {
+            *slot = u32::try_from(items.len()).ok();
+        }
+        if let Some(it) = dl.items.get(idx) {
+            items.push(it.clone());
+        }
     }
     let links = if track_links {
         dl.links.iter().filter_map(|(idx, url)| remap.get(*idx as usize).copied().flatten().map(|n| (n, url.clone()))).collect()
@@ -1449,5 +1549,152 @@ mod tests {
             assert!(darkest <= 0.5 + 1e-3, "{what}: {darkest}");
             assert!(full > 1000, "{what}: {full} pixels fully inside");
         }
+    }
+
+    fn raw_stroke_item(path: &str, color: anicraft_doc::Rgba, width: f32, join: Join) -> DisplayItem {
+        let st = Stroke::new(color, width).with_style(anicraft_doc::StrokeStyle { cap: Cap::Butt, join, ..Default::default() });
+        DisplayItem {
+            path: Arc::new(Path::from_svg(path).unwrap()),
+            transform: Affine::IDENTITY,
+            fill: None,
+            stroke: Some(st),
+            fill_rule: FillRule::NonZero,
+            color: anicraft_doc::ColorTransform::IDENTITY,
+            layer: anicraft_doc::LayerId(0),
+            element: anicraft_doc::ElementId(0),
+            outline: None,
+            clip: None,
+            masks: None,
+            guide: false,
+            group: None,
+            image: None,
+            smooth: true,
+            warp: None,
+            merge: true,
+        }
+    }
+
+    fn raw_dl(items: Vec<DisplayItem>) -> DisplayList {
+        DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: Vec::new() }
+    }
+
+    #[test]
+    fn raw_join_counts_branches_across_styles_at_three_way_junction() {
+        // Two black strokes and one red stroke meet at (100, 100): degree 3, so the black strokes
+        // must not join into a corner there.
+        let black = anicraft_doc::Rgba::BLACK;
+        let red = anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 1.0);
+        let dl = raw_dl(vec![
+            raw_stroke_item("M 0 100 L 100 100", black, 10.0, Join::Miter),
+            raw_stroke_item("M 100 100 L 100 200", black, 10.0, Join::Miter),
+            raw_stroke_item("M 100 100 L 200 100", red, 10.0, Join::Miter),
+        ]);
+        let joined = join_raw_strokes(&dl);
+        assert!(matches!(joined, std::borrow::Cow::Borrowed(_)), "three-way junction with a red branch must leave the black pair unjoined");
+        assert_eq!(joined.items.len(), 3);
+    }
+
+    #[test]
+    fn raw_join_leaves_triangle_open_at_spur_and_closes_plain_triangle() {
+        let black = anicraft_doc::Rgba::BLACK;
+        let has_close = |dl: &DisplayList| dl.items.iter().any(|it| it.path.cmds.iter().any(|c| matches!(c, PathCmd::Close)));
+        // Plain triangle: every vertex has degree 2, so all three sides chain and close.
+        let plain = raw_dl(vec![
+            raw_stroke_item("M 40 40 L 140 40", black, 12.0, Join::Miter),
+            raw_stroke_item("M 140 40 L 90 140", black, 12.0, Join::Miter),
+            raw_stroke_item("M 90 140 L 40 40", black, 12.0, Join::Miter),
+        ]);
+        let joined_plain = join_raw_strokes(&plain);
+        assert_eq!(joined_plain.items.len(), 1);
+        assert!(has_close(&joined_plain), "triangle without a spur should close");
+
+        // Triangle with a spur at (40, 40): the other two corners chain, but closure at the
+        // three-way spur vertex must not happen.
+        let spurred = raw_dl(vec![
+            raw_stroke_item("M 40 40 L 140 40", black, 12.0, Join::Miter),
+            raw_stroke_item("M 140 40 L 90 140", black, 12.0, Join::Miter),
+            raw_stroke_item("M 90 140 L 40 40", black, 12.0, Join::Miter),
+            raw_stroke_item("M 40 40 L 10 10", black, 12.0, Join::Miter),
+        ]);
+        let joined_spurred = join_raw_strokes(&spurred);
+        assert!(!has_close(&joined_spurred), "triangle with a spur must not close at the three-way vertex");
+        assert_eq!(joined_spurred.items.len(), 2, "three sides chain into one open path, spur stays separate");
+    }
+
+    #[test]
+    fn raw_join_checks_candidate_endpoint_degree_both_directions() {
+        // Three endpoints a, b, c on one line: dist(a, b) = 0.15 <= SNAP, dist(b, c) = 0.15 <= SNAP,
+        // dist(a, c) = 0.30 > SNAP. Count is 2 at a and c, 3 at b: no pair may join in either
+        // drawing order or stroke orientation (covers tail-append and head-prepend).
+        let black = anicraft_doc::Rgba::BLACK;
+        let a_tail = raw_stroke_item("M 20 100 L 99.85 100", black, 10.0, Join::Miter);
+        let a_head = raw_stroke_item("M 99.85 100 L 20 100", black, 10.0, Join::Miter);
+        let b_sub = raw_stroke_item("M 100 100 L 100 180", black, 10.0, Join::Miter);
+        let c_head = raw_stroke_item("M 100.15 100 L 180 100", black, 10.0, Join::Miter);
+        let c_tail = raw_stroke_item("M 180 100 L 100.15 100", black, 10.0, Join::Miter);
+
+        for (label, items) in [
+            ("tail-append a-b-c", vec![a_tail.clone(), b_sub.clone(), c_head.clone()]),
+            ("tail-append c-b-a", vec![c_tail.clone(), b_sub.clone(), a_head.clone()]),
+            ("head-prepend a-b-c", vec![a_head.clone(), b_sub.clone(), c_head.clone()]),
+            ("head-prepend c-b-a", vec![c_head.clone(), b_sub.clone(), a_tail.clone()]),
+        ] {
+            let dl = raw_dl(items);
+            let joined = join_raw_strokes(&dl);
+            assert!(matches!(joined, std::borrow::Cow::Borrowed(_)), "{label}: must not join into degree-3 endpoint b");
+            assert_eq!(joined.items.len(), 3, "{label}");
+        }
+    }
+
+    #[test]
+    fn raw_join_preserves_paint_order_across_intervening_stroke() {
+        // Red A and Red C meet at (100, 50), with Blue B between them crossing A at (50, 50).
+        // Blue B must stay on top of Red A in CPU, GPU scene, and SVG output.
+        let red = anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 1.0);
+        let blue = anicraft_doc::Rgba::new(0.0, 0.0, 1.0, 1.0);
+        let dl = raw_dl(vec![
+            raw_stroke_item("M 10 50 L 100 50", red, 12.0, Join::Miter),
+            raw_stroke_item("M 50 10 L 50 90", blue, 12.0, Join::Miter),
+            raw_stroke_item("M 100 50 L 100 90", red, 12.0, Join::Miter),
+        ]);
+        let joined = join_raw_strokes(&dl);
+        assert!(matches!(joined, std::borrow::Cow::Borrowed(_)), "must not chain across an intervening stroke of another style");
+        // CPU oracle: crossing pixel (50, 50) is blue, not red.
+        let view = crate::View { transform: Affine::IDENTITY, width: 120, height: 120, background: Some(anicraft_doc::Rgba::WHITE) };
+        let (pm, _) = crate::render(&dl, &view).unwrap();
+        let px = pm.pixel(50, 50).unwrap();
+        assert!(px[2] > px[0], "CPU crossing must show blue on top of red: {px:?}");
+        // GPU scene: blue fill comes after the red fill that covers (50, 50).
+        let (scene, _) = crate::prepare_scene(&dl, &view).unwrap();
+        let top_at_crossing = scene.fills.iter().rposition(|f| f.bounds.x0 <= 50 && 50 < f.bounds.x1 && f.bounds.y0 <= 50 && 50 < f.bounds.y1).unwrap();
+        assert!(matches!(scene.fills[top_at_crossing].shader, crate::paint::Shader::Solid(c) if c[2] > c[0]), "GPU scene must keep blue over red at crossing");
+        // SVG export: blue path appears after the horizontal red path.
+        let svg = crate::svg::to_svg(&dl, &anicraft_doc::Stage { width: 120, height: 120, fps: 24.0, background: anicraft_doc::Rgba::WHITE });
+        let red_a = svg.find("M10 50").unwrap();
+        let blue_b = svg.find("M50 10").unwrap();
+        assert!(red_a < blue_b, "SVG must paint red A before blue B: {svg}");
+    }
+
+    #[test]
+    fn raw_join_borrows_when_distant_and_remaps_links_when_joined() {
+        let black = anicraft_doc::Rgba::BLACK;
+        let distant = raw_dl(vec![
+            raw_stroke_item("M 0 0 L 20 0", black, 6.0, Join::Miter),
+            raw_stroke_item("M 100 0 L 120 0", black, 6.0, Join::Miter),
+        ]);
+        assert!(matches!(join_raw_strokes(&distant), std::borrow::Cow::Borrowed(_)));
+
+        let mut linked_item = raw_stroke_item("M 200 200 L 240 200", black, 6.0, Join::Miter);
+        linked_item.merge = false;
+        let mut with_link = raw_dl(vec![
+            raw_stroke_item("M 0 0 L 50 0", black, 6.0, Join::Miter),
+            raw_stroke_item("M 50 0 L 50 50", black, 6.0, Join::Miter),
+            linked_item,
+        ]);
+        with_link.links.push((2, Arc::from("https://example.com")));
+        let joined = join_raw_strokes(&with_link);
+        assert_eq!(joined.items.len(), 2);
+        assert_eq!(joined.links.len(), 1);
+        assert_eq!(joined.links[0].0, 1, "link index shifts from 2 to 1 after the first two strokes merge");
     }
 }
