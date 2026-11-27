@@ -41,6 +41,9 @@ const ARC_TOL: f32 = 0.1;
 const MAX_SAMPLES: usize = 8192;
 /// Widths below this (output units) draw nothing.
 const NO_WIDTH: f32 = 1e-4;
+/// Minimum stroke width (output pixels) rasterised at full opacity; thinner strokes are widened
+/// to this width and faded proportionally in [`stroke_geometry`].
+const MIN_RASTER_WIDTH: f32 = 1.0;
 
 /// The points of an arc round `c` of radius `r`, from angle `a0` through `sweep` radians, both
 /// ends included; empty when there is nothing to draw.
@@ -630,9 +633,9 @@ pub fn stroke_geometry(lines: &[Polyline], st: &Stroke, m: &Affine, raster: bool
     if !(widest.is_finite() && widest > 0.0) {
         return None;
     }
-    if raster && widest < 1.0 {
-        alpha *= widest;
-        pw /= widest;
+    if raster && widest < MIN_RASTER_WIDTH {
+        alpha *= widest / MIN_RASTER_WIDTH;
+        pw *= MIN_RASTER_WIDTH / widest;
     }
     let style = &st.style;
     let cap = style.effective_cap();
@@ -803,7 +806,7 @@ fn is_raw_stroke(it: &DisplayItem) -> bool {
 }
 
 fn is_joinable_raw_stroke(it: &DisplayItem) -> bool {
-    is_raw_stroke(it) && it.stroke.as_ref().is_some_and(|st| st.profile.is_none())
+    is_raw_stroke(it) && it.stroke.as_ref().is_some_and(|st| st.profile.is_none() && st.style.dash.is_none())
 }
 
 type RawRunScope = (anicraft_doc::LayerId, Option<u32>, Option<u32>, Option<u32>);
@@ -820,12 +823,16 @@ fn same_raw_style(a: &DisplayItem, b: &DisplayItem) -> bool {
     a.transform.m[..4] == b.transform.m[..4] && a.stroke == b.stroke && a.color == b.color
 }
 
-/// Whether `it`'s rendered stroke paint is fully opaque (alpha == 1 after colour transform).
-/// Opaque strokes overlapping away from a corner paint identically whether joined or separate;
-/// semi-transparent strokes darken where separate strokes overlap, so joining them would lose
+/// Whether `it`'s rasterised stroke paint is fully opaque: painted alpha == 1 after colour
+/// transform and effective device width at least [`MIN_RASTER_WIDTH`]. Opaque strokes overlapping
+/// away from a corner paint identically whether joined or separate; semi-transparent strokes —
+/// including sub-pixel strokes widened to [`MIN_RASTER_WIDTH`] at reduced alpha in
+/// [`stroke_geometry`] — darken where separate strokes overlap, so joining them would lose
 /// opacity at remote crossings.
-fn raw_stroke_opaque(it: &DisplayItem) -> bool {
-    it.stroke.as_ref().is_some_and(|st| it.color.apply(st.color).a >= 1.0)
+fn raw_stroke_opaque(it: &DisplayItem, device_width: f32) -> bool {
+    device_width.is_finite()
+        && device_width >= MIN_RASTER_WIDTH
+        && it.stroke.as_ref().is_some_and(|st| it.color.apply(st.color).a >= 1.0)
 }
 
 /// Most segment-pair distance checks for one semi-transparent join candidate; past this budget we
@@ -1203,7 +1210,12 @@ fn raw_chain_find(
 /// Chains open subpaths of the contiguous compatible run `range` (same style, linear transform and
 /// colour transform) at plain degree-2 corners using the drawing scope's stage-space endpoint table
 /// `ends`; returns `None` when nothing joins.
-fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap<(i64, i64), Vec<Vec2>>) -> Option<Vec<(usize, DisplayItem)>> {
+fn chain_raw_run(
+    dl: &DisplayList,
+    range: std::ops::Range<usize>,
+    ends: &HashMap<(i64, i64), Vec<Vec2>>,
+    view_xf: &Affine,
+) -> Option<Vec<(usize, DisplayItem)>> {
     let base = dl.items.get(range.start)?;
     let base_xf = base.transform;
     let inv = base_xf.inverse()?;
@@ -1243,9 +1255,17 @@ fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap
             grid.entry(b).or_default().push(i);
         }
     }
-    let opaque = raw_stroke_opaque(base);
     let stage_width = base.stroke.as_ref().map_or(0.0, |st| st.width * scale);
-    let flat_tol = (stage_width * 0.05).clamp(0.1, 0.5);
+    let device_scale = view_xf.mul(&base_xf).mean_scale();
+    let device_width = base.stroke.as_ref().map_or(0.0, |st| st.width * device_scale);
+    let opaque = raw_stroke_opaque(base, device_width);
+    let view_scale = view_xf.mean_scale();
+    let overlap_width = if device_width < MIN_RASTER_WIDTH && view_scale.is_finite() && view_scale > 1e-6 {
+        stage_width.max(MIN_RASTER_WIDTH / view_scale)
+    } else {
+        stage_width
+    };
+    let flat_tol = (overlap_width * 0.05).clamp(0.1, 0.5);
     let check_overlap = |cand: &RawSub, matched_start: bool, join_pt: Vec2, other_chain_pt: Vec2, cur_flat: &[(Vec2, Vec2)]| -> Option<Vec<(Vec2, Vec2)>> {
         let nf = flatten_raw_segs(cand.start, cand.segs.iter().copied(), &base_xf, flat_tol);
         let other_end = base_xf.apply(if matched_start { cand.end() } else { cand.start });
@@ -1253,9 +1273,9 @@ fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap
             && raw_plain_corner(ends, other_chain_pt)
             && raw_plain_corner(ends, other_end);
         let overlap = if closes {
-            raw_remote_overlap(cur_flat, &nf, stage_width, &[join_pt, other_chain_pt])
+            raw_remote_overlap(cur_flat, &nf, overlap_width, &[join_pt, other_chain_pt])
         } else {
-            raw_remote_overlap(cur_flat, &nf, stage_width, &[join_pt])
+            raw_remote_overlap(cur_flat, &nf, overlap_width, &[join_pt])
         };
         (!overlap).then_some(nf)
     };
@@ -1381,11 +1401,18 @@ fn chain_raw_run(dl: &DisplayList, range: std::ops::Range<usize>, ends: &HashMap
     Some(built)
 }
 
-/// `dl` with contiguous raw stroke runs (`DisplayItem::merge`) of the same style that meet at
-/// plain degree-2 corners chained into continuous paths, so corner joins (Miter, Round, Bevel)
-/// render across the separate stroke elements merge drawing splits at corners (ADR 0031, 0046).
-/// Borrowed unchanged when no raw strokes join.
+/// `dl` with contiguous solid, uniform-width raw stroke runs (`DisplayItem::merge`) of the same
+/// style that meet at plain degree-2 corners chained into continuous paths, so corner joins
+/// (Miter, Round, Bevel) render across the separate stroke elements merge drawing splits at
+/// corners (ADR 0031, 0046). Borrowed unchanged when no raw strokes join.
 pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
+    join_raw_strokes_in_view(dl, &Affine::IDENTITY)
+}
+
+/// [`join_raw_strokes`] evaluated under stage-to-device transform `view_xf`, so strokes whose
+/// rasterised device width falls below [`MIN_RASTER_WIDTH`] (and are therefore faded to reduced
+/// alpha in [`stroke_geometry`]) use the remote-overlap guard.
+pub(crate) fn join_raw_strokes_in_view<'a>(dl: &'a DisplayList, view_xf: &Affine) -> std::borrow::Cow<'a, DisplayList> {
     let compatible_pair = |a: &DisplayItem, b: &DisplayItem| {
         is_joinable_raw_stroke(a) && is_joinable_raw_stroke(b) && same_raw_run(a, b) && same_raw_style(a, b) && a.transform.inverse().is_some()
     };
@@ -1444,7 +1471,7 @@ pub fn join_raw_strokes(dl: &DisplayList) -> std::borrow::Cow<'_, DisplayList> {
             }
             j = sub_end;
             if sub_end - sub_start >= 2
-                && let Some(chained) = chain_raw_run(dl, sub_start..sub_end, ends)
+                && let Some(chained) = chain_raw_run(dl, sub_start..sub_end, ends, view_xf)
             {
                 replacements.push((sub_start..sub_end, chained));
             }
@@ -2039,5 +2066,116 @@ mod tests {
         ]);
         let joined_other = join_raw_strokes(&dl_other);
         assert_eq!(joined_other.items.len(), 3, "stroke on another layer must not block joining A and B");
+    }
+
+    #[test]
+    fn raw_join_guards_subpixel_thin_strokes_at_remote_crossings() {
+        let black = anicraft_doc::Rgba::BLACK;
+        // Two opaque 0.5 px strokes sharing (20.5, 20.5) and crossing at (70.5, 70.5). The
+        // rasteriser widens strokes below 1 device pixel to 1 px at reduced alpha (50%), so
+        // separate strokes composite to 75% at the crossing whereas joining would paint 50%.
+        let a_path = "M 20.5 20.5 L 120.5 20.5 L 120.5 70.5 L 20.5 70.5";
+        let b_path = "M 20.5 20.5 L 20.5 120.5 L 70.5 120.5 L 70.5 40.5";
+        let thin_cross = raw_dl(vec![
+            raw_stroke_item(a_path, black, 0.5, Join::Miter),
+            raw_stroke_item(b_path, black, 0.5, Join::Miter),
+        ]);
+        let joined = join_raw_strokes(&thin_cross);
+        assert!(matches!(joined, std::borrow::Cow::Borrowed(_)), "thin crossing strokes must stay separate");
+        assert_eq!(joined.items.len(), 2);
+
+        let view = crate::View { transform: Affine::IDENTITY, width: 140, height: 140, background: Some(anicraft_doc::Rgba::WHITE) };
+        let (pm, _) = crate::render(&thin_cross, &view).unwrap();
+        let single = pm.pixel(80, 20).unwrap();
+        let crossing_px = pm.pixel(70, 70).unwrap();
+        assert!(crossing_px[0] < single[0] - 0.15, "thin crossing must double-blend darker than a single stroke: cross={crossing_px:?}, single={single:?}");
+        let (scene, _) = crate::prepare_scene(&thin_cross, &view).unwrap();
+        let covers_crossing = scene.fills.iter().filter(|f| f.bounds.x0 <= 70 && 70 < f.bounds.x1 && f.bounds.y0 <= 70 && 70 < f.bounds.y1).count();
+        assert_eq!(covers_crossing, 2, "GPU scene must keep separate fills over the crossing");
+
+        // A thin 0.5 px L-shape with no remote overlap still joins.
+        let thin_l = raw_dl(vec![
+            raw_stroke_item("M 20.5 20.5 L 100.5 20.5", black, 0.5, Join::Miter),
+            raw_stroke_item("M 100.5 20.5 L 100.5 100.5", black, 0.5, Join::Miter),
+        ]);
+        let joined_l = join_raw_strokes(&thin_l);
+        assert_eq!(joined_l.items.len(), 1, "thin L-corner without remote overlap still joins");
+
+        // Parallel 0.5 px legs 0.7 px apart away from the corner overlap in their widened 1 px
+        // raster footprint, so they must also stay separate.
+        let thin_near = raw_dl(vec![
+            raw_stroke_item("M 20.5 20.5 L 80.5 20.5", black, 0.5, Join::Miter),
+            raw_stroke_item("M 20.5 20.5 L 20.5 21.2 L 80.5 21.2", black, 0.5, Join::Miter),
+        ]);
+        assert!(matches!(join_raw_strokes(&thin_near), std::borrow::Cow::Borrowed(_)), "thin legs within the widened 1 px footprint must stay separate");
+
+        // Zoomed-out view: 2 px stage strokes drawn at 0.25x have effective device width 0.5 px,
+        // so a crossing pair stays separate while an L-corner still joins.
+        let zoom_out = Affine::scale(0.25, 0.25);
+        let zoom_view = crate::View { transform: zoom_out, width: 64, height: 64, background: Some(anicraft_doc::Rgba::WHITE) };
+        let zoomed_cross = raw_dl(vec![
+            raw_stroke_item("M 42 42 L 202 42 L 202 122 L 42 122", black, 2.0, Join::Miter),
+            raw_stroke_item("M 42 42 L 42 202 L 122 202 L 122 82", black, 2.0, Join::Miter),
+        ]);
+        assert!(matches!(join_raw_strokes_in_view(&zoomed_cross, &zoom_out), std::borrow::Cow::Borrowed(_)), "zoomed-out sub-pixel crossing must stay separate");
+        let (zpm, _) = crate::render(&zoomed_cross, &zoom_view).unwrap();
+        let zsingle = zpm.pixel(30, 10).unwrap();
+        let zcross = zpm.pixel(30, 30).unwrap();
+        assert!(zcross[0] < zsingle[0] - 0.15, "zoomed-out crossing must double-blend darker: cross={zcross:?}, single={zsingle:?}");
+
+        let zoomed_l = raw_dl(vec![
+            raw_stroke_item("M 42 42 L 202 42", black, 2.0, Join::Miter),
+            raw_stroke_item("M 202 42 L 202 202", black, 2.0, Join::Miter),
+        ]);
+        assert_eq!(join_raw_strokes_in_view(&zoomed_l, &zoom_out).items.len(), 1, "zoomed-out thin L-corner without remote overlap still joins");
+    }
+
+    #[test]
+    fn raw_join_keeps_dashed_and_dotted_strokes_separate_while_joining_solid() {
+        let black = anicraft_doc::Rgba::BLACK;
+        let with_dash = |path: &str, dash: Option<anicraft_doc::Dash>| {
+            let st = Stroke::new(black, 6.0).with_style(anicraft_doc::StrokeStyle { cap: Cap::Butt, join: Join::Miter, dash, ..Default::default() });
+            DisplayItem { stroke: Some(st), ..raw_stroke_item(path, black, 6.0, Join::Miter) }
+        };
+        // 48-unit horizontal leg + vertical leg with 20-on / 8-off butt dashes: 32.5 units down
+        // the vertical leg has phase 4.5 (painted) when separate, vs 24.5 (gap) if joined.
+        let dash = anicraft_doc::Dash::dashed(20.0, 8.0);
+        let dashed = raw_dl(vec![
+            with_dash("M 20 20 L 68 20", dash.clone()),
+            with_dash("M 68 20 L 68 80", dash.clone()),
+        ]);
+        let joined_dashed = join_raw_strokes(&dashed);
+        assert!(matches!(joined_dashed, std::borrow::Cow::Borrowed(_)), "dashed strokes meeting at a corner must stay separate");
+        assert_eq!(joined_dashed.items.len(), 2);
+        let view = crate::View { transform: Affine::IDENTITY, width: 100, height: 100, background: Some(anicraft_doc::Rgba::WHITE) };
+        let (pm, _) = crate::render(&dashed, &view).unwrap();
+        let vertical_dash_px = pm.pixel(68, 52).unwrap();
+        assert!(vertical_dash_px[0] < 0.2, "second leg must keep its own dash phase (painted at y=52.5): {vertical_dash_px:?}");
+
+        // Dotted strokes also stay separate.
+        let dots = anicraft_doc::Dash::dotted(6.0);
+        let dotted = raw_dl(vec![
+            with_dash("M 20 20 L 68 20", dots.clone()),
+            with_dash("M 68 20 L 68 80", dots),
+        ]);
+        let joined_dotted = join_raw_strokes(&dotted);
+        assert!(matches!(joined_dotted, std::borrow::Cow::Borrowed(_)), "dotted strokes meeting at a corner must stay separate");
+        assert_eq!(joined_dotted.items.len(), 2);
+
+        // Solid strokes on the same corner still join.
+        let solid = raw_dl(vec![
+            with_dash("M 20 20 L 68 20", None),
+            with_dash("M 68 20 L 68 80", None),
+        ]);
+        let joined_solid = join_raw_strokes(&solid);
+        assert_eq!(joined_solid.items.len(), 1, "solid strokes meeting at a corner still join");
+
+        // A dashed third branch at a solid corner still counts toward endpoint degree.
+        let solid_with_dashed_spur = raw_dl(vec![
+            with_dash("M 20 20 L 68 20", None),
+            with_dash("M 68 20 L 68 80", None),
+            with_dash("M 68 20 L 96 20", dash),
+        ]);
+        assert!(matches!(join_raw_strokes(&solid_with_dashed_spur), std::borrow::Cow::Borrowed(_)), "dashed branch at a three-way junction must still keep solid legs unjoined");
     }
 }
